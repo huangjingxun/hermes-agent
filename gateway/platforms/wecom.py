@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import itertools
 import json
 import logging
 import mimetypes
@@ -175,6 +176,21 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        # ═══════════════════════════════════════════════════════════════════
+        # BEGIN CUSTOM: Approval card support
+        # ═══════════════════════════════════════════════════════════════════
+        self._approval_state: Dict[int, Tuple[str, str]] = {}
+        self._approval_counter = itertools.count(1)
+        self._approval_startup_seed = int(time.time())
+        self._approval_admin_ids = _coerce_list(
+            extra.get("allow_admin_from") or extra.get("allowAdminFrom")
+        )
+        self._approval_group_admin_ids = _coerce_list(
+            extra.get("group_allow_admin_from") or extra.get("groupAllowAdminFrom")
+        )
+        # ═══════════════════════════════════════════════════════════════════
+        # END CUSTOM: Approval card support
+        # ═══════════════════════════════════════════════════════════════════
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -398,7 +414,16 @@ class WeComAdapter(BasePlatformAdapter):
         if cmd in CALLBACK_COMMANDS:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd == APP_CMD_EVENT_CALLBACK:
+            # ═══════════════════════════════════════════════════════════════
+            # BEGIN CUSTOM: Route template-card button click events
+            # ═══════════════════════════════════════════════════════════════
+            await self._on_event_callback(payload)
+            # ═══════════════════════════════════════════════════════════════
+            # END CUSTOM: Route template-card button click events
+            # ═══════════════════════════════════════════════════════════════
+            return
+        if cmd == APP_CMD_PING:
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -1490,6 +1515,215 @@ class WeComAdapter(BasePlatformAdapter):
             "name": chat_id,
             "type": "group" if chat_id and chat_id.lower().startswith("group") else "dm",
         }
+
+    # ═══════════════════════════════════════════════════════════════════
+    # BEGIN CUSTOM: Template-card approval flow
+    # ═══════════════════════════════════════════════════════════════════
+
+    _APPROVAL_CHOICE_LABELS = {
+        "once": "执行一次",
+        "session": "本次会话",
+        "always": "永久允许",
+        "deny": "拒绝",
+    }
+
+    _APPROVAL_CHOICE_MAP = {
+        "ea:once": "once",
+        "ea:session": "session",
+        "ea:always": "always",
+        "ea:deny": "deny",
+    }
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a WeCom ``button_interaction`` template card for command approval.
+
+        The card displays the full command and reason, and provides four
+        buttons (once / session / always / deny).  Button clicks are
+        handled via ``aibot_event_callback`` in ``_on_event_callback``.
+        """
+        del metadata
+        if not self._ws or self._ws.closed:
+            return SendResult(success=False, error="Not connected")
+        try:
+            approval_id = next(self._approval_counter)
+            task_id = f"{self._approval_startup_seed}{approval_id}"
+            body = {
+                "chatid": chat_id,
+                "msgtype": "template_card",
+                "template_card": {
+                    "card_type": "button_interaction",
+                    "main_title": {
+                        "title": "⚠️ 命令审批",
+                    },
+                    "sub_title_text": command,
+                    "quote_area": {
+                        "title": "原因",
+                        "quote_text": description,
+                    },
+                    "task_id": task_id,
+                    "button_list": [
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["once"],
+                            "style": 1,
+                            "key": f"ea:once:{approval_id}",
+                        },
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["session"],
+                            "style": 1,
+                            "key": f"ea:session:{approval_id}",
+                        },
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["always"],
+                            "style": 1,
+                            "key": f"ea:always:{approval_id}",
+                        },
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["deny"],
+                            "style": 2,
+                            "key": f"ea:deny:{approval_id}",
+                        },
+                    ],
+                },
+            }
+            logger.debug(
+                "[%s] send_exec_approval card body: chatid=%s desc='%s' task_id=%s quote_text_len=%d",
+                self.name, chat_id, description, task_id, len(command),
+            )
+            response = await self._send_request(APP_CMD_SEND, body)
+            error = self._response_error(response)
+            if error:
+                return SendResult(success=False, error=error)
+            self._approval_state[approval_id] = (session_key, chat_id)
+            return SendResult(
+                success=True,
+                message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
+                raw_response=response,
+            )
+        except Exception as exc:
+            logger.warning("[%s] send_exec_approval failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _on_event_callback(self, payload: Dict[str, Any]) -> None:
+        """Handle ``aibot_event_callback`` — template-card button clicks."""
+        body = payload.get("body")
+        if not isinstance(body, dict):
+            return
+        logger.debug(
+            "[%s] Event callback raw body: %s",
+            self.name, json.dumps(body, ensure_ascii=False),
+        )
+        event_type = str(body.get("event_type") or "").lower()
+        logger.debug("[%s] Event callback: event_type=%s", self.name, event_type)
+        value = self._extract_button_value(body)
+        if not value:
+            return
+        parts = value.split(":")
+        if len(parts) < 2:
+            logger.debug("[%s] Unrecognised button value: %s", self.name, value)
+            return
+        prefix = f"{parts[0]}:{parts[1]}"
+        choice = self._APPROVAL_CHOICE_MAP.get(prefix)
+        if not choice:
+            logger.debug("[%s] Unrecognised button choice: %s", self.name, prefix)
+            return
+        approval_id_str = parts[2] if len(parts) > 2 else None
+        approval_id = int(approval_id_str) if approval_id_str and approval_id_str.isdigit() else None
+        if approval_id is None:
+            return
+        from_info = body.get("from")
+        clicker_id = from_info.get("userid") if isinstance(from_info, dict) else None
+        if not self._is_approval_admin(clicker_id):
+            logger.debug(
+                "[%s] Ignored approval click from non-admin user %s (approval_id=%s)",
+                self.name, clicker_id, approval_id_str,
+            )
+            return
+        session_key, target_chat = self._approval_state.pop(approval_id, (None, None))
+        if not session_key:
+            logger.debug("[%s] Approval %d not found or already resolved", self.name, approval_id)
+            return
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(session_key, choice)
+            logger.info(
+                "[%s] Approval %d resolved: choice=%s, session=%s (%d entries)",
+                self.name, approval_id, choice, session_key, count,
+            )
+            if target_chat:
+                from agent.i18n import t
+                if choice == "deny":
+                    confirm_msg = t("gateway.deny.denied_singular")
+                else:
+                    confirm_msg = t(f"gateway.approve.{choice}_singular")
+                asyncio.ensure_future(self.send(target_chat, confirm_msg))
+        except Exception as exc:
+            logger.error("[%s] Failed to resolve gateway approval: %s", self.name, exc)
+
+    @staticmethod
+    def _extract_button_value(body: Dict[str, Any]) -> Optional[str]:
+        """Extract the button key value from an event callback payload.
+
+        Tries several common payload shapes since WeCom may deliver
+        button clicks in different formats depending on the event type.
+        """
+        # Shape 1: {"selected_button": {"key": "..."}} — button_interaction
+        selected = body.get("selected_button")
+        if isinstance(selected, dict):
+            val = selected.get("key") or selected.get("value")
+            if val:
+                return str(val)
+        # Shape 2: {"event_data": {"key": "..."}}
+        event_data = body.get("event_data")
+        if isinstance(event_data, dict):
+            val = event_data.get("key") or event_data.get("value")
+            if val:
+                return str(val)
+        # Shape 3: {"action_info": {"key": "..."}}
+        action_info = body.get("action_info")
+        if isinstance(action_info, dict):
+            val = action_info.get("key") or action_info.get("value")
+            if val:
+                return str(val)
+        # Shape 4: top-level "key" or "value" field
+        val = body.get("key") or body.get("value")
+        if val:
+            return str(val)
+        # Shape 5: {"event": {"template_card_event": {"event_key": "..."}}}
+        # WeCom AI Bot WS button_interaction real payload.
+        event = body.get("event")
+        if isinstance(event, dict):
+            tce = event.get("template_card_event")
+            if isinstance(tce, dict):
+                val = tce.get("event_key")
+                if val:
+                    return str(val)
+        return None
+
+    def _is_approval_admin(self, userid: Optional[str]) -> bool:
+        """Return True when *userid* is in any admin allowlist.
+
+        Both ``allow_admin_from`` (private-chat admins) and
+        ``group_allow_admin_from`` (group-chat admins) are checked.
+        If neither list is configured, the gate is **open** for
+        backward compatibility.
+        """
+        if not userid:
+            return False
+        combined = self._approval_admin_ids + self._approval_group_admin_ids
+        if not combined:
+            return True
+        return _entry_matches(combined, userid)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # END CUSTOM: Template-card approval flow
+    # ═══════════════════════════════════════════════════════════════════
 
 
 # ------------------------------------------------------------------
