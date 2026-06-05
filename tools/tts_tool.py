@@ -1845,6 +1845,36 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    # BEGIN CUSTOM: strip emoji before TTS synthesis
+    # Only modern emoji pictographs and dingbats that TTS engines mispronounce
+    # are removed. Kaomoji (≧▽≦), box-drawing (┌─┐│), punctuation, and all
+    # plain text characters are PRESERVED.
+    _cleaned = re.sub(
+        r"[\U0001F1E0-\U0001F1FF"
+        r"\U0001F300-\U0001F5FF"
+        r"\U0001F600-\U0001F64F"
+        r"\U0001F680-\U0001F6FF"
+        r"\U0001F7E0-\U0001F7FF"
+        r"\U0001F900-\U0001F9FF"
+        r"\U0001FA00-\U0001FA6F"
+        r"\U0001FA70-\U0001FAFF"
+        r"\uFE0F"  # emoji style variation selector
+        r"\u2705\u2714\u274C\u2716\u2718"
+        r"\u27A1\u2B05\u2B06\u2B07\u2B55\u26A0]",
+        "",
+        text,
+    )
+    _cleaned = re.sub(r"\s+", " ", _cleaned).strip()
+    if _cleaned != text:
+        logger.debug(
+            "TTS text sanitized: removed %d decorative chars"
+            "; original text length %d",
+            len(text) - len(_cleaned),
+            len(text),
+        )
+    text = _cleaned
+    # END CUSTOM
+
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
 
