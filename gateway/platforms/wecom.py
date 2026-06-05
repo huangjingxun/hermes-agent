@@ -39,6 +39,7 @@ import mimetypes
 import os
 import re
 import time
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1532,10 +1533,55 @@ class WeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
+        """Send a voice message to WeCom.
+
+        Converts the input audio to AMR-NB (8 kHz / 12.20 kbps) so it displays
+        as a native voice bubble on mobile clients.
+        """
         del kwargs
+        path = Path(audio_path)
+        if not path.exists():
+            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+
+        # BEGIN CUSTOM: AMR transcoding optimisation
+        amr_path = path.with_suffix(".amr")
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(path),
+                    "-ar", "8000", "-ac", "1",
+                    "-af", (
+                        "deesser=i=1.0:m=1,"
+                        "lowpass=f=3200,"
+                        "acompressor=threshold=-3dB:ratio=2:attack=5:release=50"
+                    ),
+                    "-acodec", "amr_nb", "-b:a", "12.20k",
+                    str(amr_path),
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+            if result.returncode != 0 or not amr_path.exists():
+                logger.warning(
+                    "[%s] AMR-NB conversion failed, sending raw: %s",
+                    self.name,
+                    result.stderr.decode() if result.stderr else "unknown error",
+                )
+                amr_path = path  # fallback to original
+            else:
+                logger.info(
+                    "[%s] Converted %s to AMR-NB (8kHz/12.20kbps)",
+                    self.name,
+                    path.name,
+                )
+        except Exception as exc:
+            logger.warning("[%s] AMR conversion error: %s", self.name, exc)
+            amr_path = path  # fallback to original
+        # END CUSTOM
+
         return await self._send_media_source(
             chat_id=chat_id,
-            media_source=audio_path,
+            media_source=str(amr_path),
             caption=caption,
             reply_to=reply_to,
         )
