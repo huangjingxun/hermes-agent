@@ -232,12 +232,12 @@ def setup_logging(
         formatter=RedactingFormatter(_LOG_FORMAT),
     )
 
-    # --- gateway.log (INFO+, gateway component only) ------------------------
+    # --- gateway.log (level from config, gateway component only) ------------
     if mode == "gateway":
         _add_rotating_handler(
             root,
             log_dir / "gateway.log",
-            level=logging.INFO,
+            level=level,
             max_bytes=5 * 1024 * 1024,
             backup_count=3,
             formatter=RedactingFormatter(_LOG_FORMAT),
