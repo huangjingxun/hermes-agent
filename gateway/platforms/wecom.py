@@ -95,6 +95,28 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
 DEDUP_MAX_SIZE = 1000
 
+# ═══════════════════════════════════════════════════════════════════
+# BEGIN CUSTOM: Send-audit logger (append-only, daily rotation, 7 days)
+# ═══════════════════════════════════════════════════════════════════
+_audit_logger = logging.getLogger("wecom_send_audit")
+_audit_logger.propagate = False
+_AUDIT_LOG_PATH = Path.home() / ".hermes" / "logs" / "send-audit.log"
+_AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+if not _audit_logger.handlers:
+    from logging.handlers import TimedRotatingFileHandler
+    _audit_handler = TimedRotatingFileHandler(
+        _AUDIT_LOG_PATH, when="midnight", interval=1, backupCount=7, encoding="utf-8",
+    )
+    _audit_handler.setFormatter(logging.Formatter(
+        "%(asctime)s|%(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _audit_logger.setLevel(logging.INFO)
+    _audit_logger.addHandler(_audit_handler)
+# ═══════════════════════════════════════════════════════════════════
+# END CUSTOM: Send-audit logger
+# ═══════════════════════════════════════════════════════════════════
+
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 10 * 1024 * 1024
 VOICE_MAX_BYTES = 2 * 1024 * 1024
@@ -184,6 +206,30 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
+
+    # ═══════════════════════════════════════════════════════════════════
+    # BEGIN CUSTOM: Send-audit helper
+    # ═══════════════════════════════════════════════════════════════════
+    @staticmethod
+    def _audit_log(
+        method: str,
+        chat_id: str,
+        chat_type: int,
+        content_type: str,
+        detail: str,
+        result: str,
+    ) -> None:
+        """Append a single audit record. Failure is swallowed — never blocks send."""
+        try:
+            _audit_logger.info(
+                "%s|%s|%d|%s|%s|%s",
+                method, chat_id, chat_type, content_type, detail, result,
+            )
+        except Exception:
+            pass
+    # ═══════════════════════════════════════════════════════════════════
+    # END CUSTOM: Send-audit helper
+    # ═══════════════════════════════════════════════════════════════════
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -1356,6 +1402,7 @@ class WeComAdapter(BasePlatformAdapter):
         del metadata
 
         if not chat_id:
+            self._audit_log("send", chat_id, 0, "text", "0", "error:chat_id_empty")
             return SendResult(success=False, error="chat_id is required")
 
         try:
@@ -1376,15 +1423,19 @@ class WeComAdapter(BasePlatformAdapter):
                     },
                 )
         except asyncio.TimeoutError:
+            self._audit_log("send", chat_id, 0, "text", str(len(content)), "error:timeout")
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
+            self._audit_log("send", chat_id, 0, "text", str(len(content)), f"error:{exc}")
             logger.error("[%s] Send failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
 
         error = self._response_error(response)
         if error:
+            self._audit_log("send", chat_id, 0, "text", str(len(content)), f"error:{error}")
             return SendResult(success=False, error=error)
 
+        self._audit_log("send", chat_id, 0, "text", str(len(content)), "success")
         return SendResult(
             success=True,
             message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
@@ -1473,12 +1524,19 @@ class WeComAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         del kwargs
-        return await self._send_media_source(
+        chat_type = 1 if chat_id.startswith("wo") else (2 if chat_id.startswith("wr") else 0)
+        self._audit_log("send_video", chat_id, chat_type, "video", video_path, "attempt")
+        result = await self._send_media_source(
             chat_id=chat_id,
             media_source=video_path,
             caption=caption,
             reply_to=reply_to,
         )
+        self._audit_log(
+            "send_video", chat_id, chat_type, "video", video_path,
+            "success" if result.success else f"error:{result.error}",
+        )
+        return result
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """WeCom does not expose typing indicators in this adapter."""
