@@ -38,6 +38,7 @@ import queue
 import threading
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -377,7 +378,13 @@ def _normalize_retain_tags(value: Any) -> List[str]:
 
 
 def _utc_timestamp() -> str:
-    """Return current UTC timestamp in ISO-8601 with milliseconds and Z suffix."""
+    """Return current timestamp in ISO-8601 with milliseconds."""
+    tz_name = os.environ.get("HERMES_TIMEZONE", "")
+    if tz_name:
+        try:
+            return datetime.now(ZoneInfo(tz_name)).isoformat(timespec="milliseconds")
+        except ZoneInfoNotFoundError:
+            pass
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
@@ -1361,7 +1368,14 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        now = datetime.now(timezone.utc).isoformat()
+        tz_name = os.environ.get("HERMES_TIMEZONE", "")
+        if tz_name:
+            try:
+                now = datetime.now(ZoneInfo(tz_name)).isoformat()
+            except ZoneInfoNotFoundError:
+                now = datetime.now(timezone.utc).isoformat()
+        else:
+            now = datetime.now(timezone.utc).isoformat()
         return [
             {
                 "role": "user",
