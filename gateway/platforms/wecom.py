@@ -81,6 +81,7 @@ APP_CMD_LEGACY_CALLBACK = "aibot_callback"
 APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
 APP_CMD_SEND = "aibot_send_msg"
 APP_CMD_RESPONSE = "aibot_respond_msg"
+APP_CMD_RESPONSE_UPDATE = "aibot_respond_update_msg"
 APP_CMD_PING = "ping"
 APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
 APP_CMD_UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
@@ -97,9 +98,6 @@ RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
 DEDUP_MAX_SIZE = 1000
 
-# ═══════════════════════════════════════════════════════════════════
-# BEGIN CUSTOM: Send-audit logger (append-only, daily rotation, 7 days)
-# ═══════════════════════════════════════════════════════════════════
 _audit_logger = logging.getLogger("wecom_send_audit")
 _audit_logger.propagate = False
 _AUDIT_LOG_PATH = Path.home() / ".hermes" / "logs" / "send-audit.log"
@@ -115,9 +113,6 @@ if not _audit_logger.handlers:
     ))
     _audit_logger.setLevel(logging.INFO)
     _audit_logger.addHandler(_audit_handler)
-# ═══════════════════════════════════════════════════════════════════
-# END CUSTOM: Send-audit logger
-# ═══════════════════════════════════════════════════════════════════
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 10 * 1024 * 1024
@@ -200,9 +195,7 @@ class WeComAdapter(BasePlatformAdapter):
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
         # ═══════════════════════════════════════════════════════════════════
-        # BEGIN CUSTOM: Approval card support
-        # ═══════════════════════════════════════════════════════════════════
-        self._approval_state: Dict[int, Tuple[str, str]] = {}
+        self._approval_state: Dict[int, Tuple[str, str, str, str, str]] = {}
         self._approval_counter = itertools.count(1)
         self._approval_startup_seed = int(time.time())
         self._approval_admin_ids = _coerce_list(
@@ -211,9 +204,6 @@ class WeComAdapter(BasePlatformAdapter):
         self._approval_group_admin_ids = _coerce_list(
             extra.get("group_allow_admin_from") or extra.get("groupAllowAdminFrom")
         )
-        # ═══════════════════════════════════════════════════════════════════
-        # END CUSTOM: Approval card support
-        # ═══════════════════════════════════════════════════════════════════
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -224,9 +214,6 @@ class WeComAdapter(BasePlatformAdapter):
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
 
-    # ═══════════════════════════════════════════════════════════════════
-    # BEGIN CUSTOM: Send-audit helper
-    # ═══════════════════════════════════════════════════════════════════
     @staticmethod
     def _audit_log(
         method: str,
@@ -244,9 +231,6 @@ class WeComAdapter(BasePlatformAdapter):
             )
         except Exception:
             pass
-    # ═══════════════════════════════════════════════════════════════════
-    # END CUSTOM: Send-audit helper
-    # ═══════════════════════════════════════════════════════════════════
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -462,13 +446,7 @@ class WeComAdapter(BasePlatformAdapter):
             await self._on_message(payload)
             return
         if cmd == APP_CMD_EVENT_CALLBACK:
-            # ═══════════════════════════════════════════════════════════════
-            # BEGIN CUSTOM: Route template-card button click events
-            # ═══════════════════════════════════════════════════════════════
-            await self._on_event_callback(payload)
-            # ═══════════════════════════════════════════════════════════════
-            # END CUSTOM: Route template-card button click events
-            # ═══════════════════════════════════════════════════════════════
+            asyncio.ensure_future(self._on_event_callback(payload))
             return
         if cmd == APP_CMD_PING:
             return
@@ -703,7 +681,7 @@ class WeComAdapter(BasePlatformAdapter):
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return
-            logger.info(
+            logger.debug(
                 "[WeCom] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
@@ -1543,7 +1521,6 @@ class WeComAdapter(BasePlatformAdapter):
         if not path.exists():
             return SendResult(success=False, error=f"Audio file not found: {audio_path}")
 
-        # BEGIN CUSTOM: AMR transcoding optimisation
         amr_path = path.with_suffix(".amr")
         try:
             result = subprocess.run(
@@ -1569,7 +1546,7 @@ class WeComAdapter(BasePlatformAdapter):
                 )
                 amr_path = path  # fallback to original
             else:
-                logger.info(
+                logger.debug(
                     "[%s] Converted %s to AMR-NB (8kHz/12.20kbps)",
                     self.name,
                     path.name,
@@ -1577,7 +1554,6 @@ class WeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[%s] AMR conversion error: %s", self.name, exc)
             amr_path = path  # fallback to original
-        # END CUSTOM
 
         return await self._send_media_source(
             chat_id=chat_id,
@@ -1620,16 +1596,14 @@ class WeComAdapter(BasePlatformAdapter):
             "type": "group" if chat_id and chat_id.lower().startswith("group") else "dm",
         }
 
-    # ═══════════════════════════════════════════════════════════════════
-    # BEGIN CUSTOM: Template-card approval flow
-    # ═══════════════════════════════════════════════════════════════════
-
     _APPROVAL_CHOICE_LABELS = {
         "once": "执行一次",
         "session": "本次会话",
         "always": "永久允许",
         "deny": "拒绝",
     }
+
+    _APPROVAL_UNAUTHORIZED_TEXT = "⛔ 无权限，操作被拒绝"
 
     _APPROVAL_CHOICE_MAP = {
         "ea:once": "once",
@@ -1704,7 +1678,7 @@ class WeComAdapter(BasePlatformAdapter):
             error = self._response_error(response)
             if error:
                 return SendResult(success=False, error=error)
-            self._approval_state[approval_id] = (session_key, chat_id)
+            self._approval_state[approval_id] = (session_key, chat_id, task_id, command, description)
             return SendResult(
                 success=True,
                 message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
@@ -1728,6 +1702,13 @@ class WeComAdapter(BasePlatformAdapter):
         value = self._extract_button_value(body)
         if not value:
             return
+
+        # Extract reply_req_id early so test path can reuse it
+        reply_req_id: Optional[str] = None
+        headers = payload.get("headers")
+        if isinstance(headers, dict):
+            reply_req_id = headers.get("req_id") or headers.get("reqId")
+
         parts = value.split(":")
         if len(parts) < 2:
             logger.debug("[%s] Unrecognised button value: %s", self.name, value)
@@ -1735,31 +1716,103 @@ class WeComAdapter(BasePlatformAdapter):
         prefix = f"{parts[0]}:{parts[1]}"
         choice = self._APPROVAL_CHOICE_MAP.get(prefix)
         if not choice:
+            # 这里可以扩展额外按钮前缀，当前无额外类型
             logger.debug("[%s] Unrecognised button choice: %s", self.name, prefix)
             return
         approval_id_str = parts[2] if len(parts) > 2 else None
         approval_id = int(approval_id_str) if approval_id_str and approval_id_str.isdigit() else None
         if approval_id is None:
             return
+
+        # ── Extract routing fields ────────────────────────────────────
         from_info = body.get("from")
         clicker_id = from_info.get("userid") if isinstance(from_info, dict) else None
-        if not self._is_approval_admin(clicker_id):
+        chatid = body.get("chatid")
+        chattype = body.get("chattype")  # "single" | "group"
+
+        # Extract the original card's task_id (for card identity)
+        event_data = body.get("event", {})
+        if isinstance(event_data, dict):
+            tce = event_data.get("template_card_event", {})
+            if isinstance(tce, dict):
+                task_id = tce.get("task_id")
+            else:
+                task_id = None
+        else:
+            task_id = None
+
+        # Look up state early so both admin and non-admin paths can access command/desc
+        approval_info = self._approval_state.get(approval_id)
+        if approval_info:
+            session_key, target_chat, stored_task_id, original_command, original_desc = approval_info
+        else:
+            session_key, target_chat, stored_task_id, original_command, original_desc = "", "", "", "", ""
+
+        # Fallback task_id (should match, but tolerate mismatch)
+        effective_task_id = task_id or stored_task_id
+
+        # ── Non-admin click ───────────────────────────────────────────
+        if not self._is_callback_user_authorized(clicker_id, chattype):
+            if chattype == "single":
+                # Private chat: send text refusal, leave card untouched
+                if chatid:
+                    asyncio.ensure_future(
+                        self.send(chatid, self._APPROVAL_UNAUTHORIZED_TEXT)
+                    )
+            elif chattype == "group" and reply_req_id and effective_task_id and clicker_id:
+                # Group chat: update only this user's card copy
+                asyncio.ensure_future(
+                    self._send_update_card(
+                        reply_req_id=reply_req_id,
+                        task_id=effective_task_id,
+                        value=self._APPROVAL_UNAUTHORIZED_TEXT,
+                        userids=[clicker_id],
+                        command=original_command,
+                        description=original_desc,
+                    )
+                )
             logger.debug(
-                "[%s] Ignored approval click from non-admin user %s (approval_id=%s)",
-                self.name, clicker_id, approval_id_str,
+                "[%s] Ignored approval click from non-admin user %s (approval_id=%s, chattype=%s)",
+                self.name, clicker_id, approval_id_str, chattype,
             )
             return
-        session_key, target_chat = self._approval_state.pop(approval_id, (None, None))
-        if not session_key:
+
+        # ── Admin click: Telegram-style atomic pop ──
+        approval_info = self._approval_state.pop(approval_id, None)
+        if not approval_info:
+            # State already cleaned up (session restart, or another callback popped first)
             logger.debug("[%s] Approval %d not found or already resolved", self.name, approval_id)
             return
+        session_key, target_chat, stored_task_id, original_command, original_desc = approval_info
+
+        # ── Resolve (behind the gate) ─────────────────────────────────
         try:
             from tools.approval import resolve_gateway_approval
             count = resolve_gateway_approval(session_key, choice)
-            logger.info(
+            logger.debug(
                 "[%s] Approval %d resolved: choice=%s, session=%s (%d entries)",
                 self.name, approval_id, choice, session_key, count,
             )
+        except Exception as exc:
+            logger.error("[%s] Failed to resolve gateway approval: %s", self.name, exc)
+            count = 0
+
+        if count > 0:
+            result_value = self._APPROVAL_CHOICE_LABELS[choice]
+
+            # Update card (full broadcast, no userids) — rebuild original card, only swap buttons
+            if reply_req_id and effective_task_id:
+                asyncio.ensure_future(
+                    self._send_update_card(
+                        reply_req_id=reply_req_id,
+                        task_id=effective_task_id,
+                        value=result_value,
+                        command=original_command,
+                        description=original_desc,
+                    )
+                )
+
+            # Send confirmation message
             if target_chat:
                 from agent.i18n import t
                 if choice == "deny":
@@ -1767,8 +1820,8 @@ class WeComAdapter(BasePlatformAdapter):
                 else:
                     confirm_msg = t(f"gateway.approve.{choice}_singular")
                 asyncio.ensure_future(self.send(target_chat, confirm_msg))
-        except Exception as exc:
-            logger.error("[%s] Failed to resolve gateway approval: %s", self.name, exc)
+
+            # No deferred cleanup needed — state already popped at entry
 
     @staticmethod
     def _extract_button_value(body: Dict[str, Any]) -> Optional[str]:
@@ -1810,24 +1863,97 @@ class WeComAdapter(BasePlatformAdapter):
                     return str(val)
         return None
 
-    def _is_approval_admin(self, userid: Optional[str]) -> bool:
-        """Return True when *userid* is in any admin allowlist.
+    async def _send_update_card(
+        self,
+        reply_req_id: str,
+        task_id: str,
+        value: str,
+        userids: Optional[List[str]] = None,
+        command: str = "",
+        description: str = "",
+    ) -> None:
+        """Update a template card in-place via the WebSocket update command.
 
-        Both ``allow_admin_from`` (private-chat admins) and
-        ``group_allow_admin_from`` (group-chat admins) are checked.
-        If neither list is configured, the gate is **open** for
-        backward compatibility.
+        Rebuilds the original card shape, replacing only the button list
+        with a single sentinel (noop) button that shows the result.
+
+        Must be called within 5 seconds of the original ``aibot_event_callback``
+        and must reuse its ``req_id`` in the ``headers``.
+        """
+        logger.debug(
+            "[Wecom] _send_update_card called: req_id=%s task_id=%s value=%s userids=%s",
+            reply_req_id, task_id, value, userids,
+        )
+        body: Dict[str, Any] = {
+            "response_type": "update_template_card",
+            "template_card": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "⚠️ 命令审批"},
+                "sub_title_text": command,
+                "quote_area": {
+                    "title": "原因",
+                    "quote_text": description,
+                },
+                "task_id": task_id,
+                # button_interaction update 必须保留 ≥1 个按钮（服务端 40016 校验）
+                "button_list": [
+                    {"text": value, "style": 4, "key": "noop:handled"},
+                ],
+            },
+        }
+        if userids is not None:
+            body["userids"] = userids
+
+        try:
+            resp = await self._send_reply_request(
+                reply_req_id,
+                body,
+                cmd=APP_CMD_RESPONSE_UPDATE,
+                timeout=5.0,
+            )
+            errcode = resp.get("errcode")
+            errmsg = resp.get("errmsg")
+            if errcode not in (0, None):
+                logger.error(
+                    "[Wecom] Card update FAILED (req_id=%s, task_id=%s): errcode=%s errmsg=%s",
+                    reply_req_id, task_id, errcode, errmsg,
+                )
+            else:
+                logger.debug(
+                    "[WeCom] Card update OK (req_id=%s, task_id=%s)",
+                    reply_req_id, task_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "[WeCom] Card update FAILED (req_id=%s): %s: %s",
+                reply_req_id, type(exc).__name__, exc, exc_info=True,
+            )
+
+    def _is_callback_user_authorized(
+        self,
+        userid: Optional[str],
+        chattype: Optional[str] = None,
+    ) -> bool:
+        """Return True when *userid* is authorized to approve in the given context.
+
+        Private chats (``chattype == "single"``) use ``_approval_admin_ids``.
+        Group chats (``chattype == "group"``) use ``_approval_group_admin_ids``.
+        An explicitly empty allowlist is treated as **deny-all** (secure
+        default).  Unrecognised *chattype* falls back to the DM list.
         """
         if not userid:
             return False
-        combined = self._approval_admin_ids + self._approval_group_admin_ids
-        if not combined:
-            return True
-        return _entry_matches(combined, userid)
 
-    # ═══════════════════════════════════════════════════════════════════
-    # END CUSTOM: Template-card approval flow
-    # ═══════════════════════════════════════════════════════════════════
+        if chattype == "group":
+            admins = self._approval_group_admin_ids
+        elif chattype == "single":
+            admins = self._approval_admin_ids
+        else:
+            admins = self._approval_admin_ids
+
+        if not admins:
+            return False
+        return _entry_matches(admins, userid)
 
 
 # ------------------------------------------------------------------
