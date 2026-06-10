@@ -1,7 +1,7 @@
 """Identity and room registry for memory tag isolation.
 
 Reads ~/.hermes/config/memory/identity-registry.json and
-room-registry.json to resolve platform+user_id → identity mapping.
+room-registry.json to resolve platform+open_id → identity mapping.
 """
 
 from __future__ import annotations
@@ -30,23 +30,23 @@ def _save_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def resolve_identity(platform: str, user_id: str) -> tuple[str, str] | None:
-    """Resolve platform+user_id to (identity_name, priority).
+def resolve_identity(platform: str, open_id: str) -> tuple[str, str] | None:
+    """Resolve platform+open_id to (identity_name, priority).
     
     Returns None if not found and registry empty.
     """
-    if not platform or not user_id:
+    if not platform or not open_id:
         return None
     path = get_config_memory_dir() / "identity-registry.json"
     data = _load_json(path)
     for identity in data.get("identities", []):
         for alias in identity.get("aliases", []):
-            if alias.get("platform") == platform and alias.get("user_id") == user_id:
+            if alias.get("platform") == platform and alias.get("open_id") == open_id:
                 return identity.get("name", ""), identity.get("priority", "user")
     return None
 
 
-def auto_register_identity(platform: str, user_id: str, label: str = "") -> tuple[str, str]:
+def auto_register_identity(platform: str, open_id: str, label: str = "") -> tuple[str, str]:
     """Auto-register unknown user as identity:user with one alias.
     
     Returns (identity_name, priority).
@@ -58,11 +58,11 @@ def auto_register_identity(platform: str, user_id: str, label: str = "") -> tupl
     # Check if already exists
     for identity in identities:
         for alias in identity.get("aliases", []):
-            if alias.get("platform") == platform and alias.get("user_id") == user_id:
+            if alias.get("platform") == platform and alias.get("open_id") == open_id:
                 return identity.get("name", ""), identity.get("priority", "user")
     
     # Determine name
-    name = label.strip() or user_id[:20]
+    name = label.strip() or open_id[:20]
     
     # Avoid duplicate names among existing identities
     existing_names = {i.get("name", "") for i in identities}
@@ -75,7 +75,7 @@ def auto_register_identity(platform: str, user_id: str, label: str = "") -> tupl
     new_identity = {
         "name": name,
         "priority": "user",
-        "aliases": [{"platform": platform, "user_id": user_id, "label": label}]
+        "aliases": [{"platform": platform, "open_id": open_id, "label": label}]
     }
     identities.append(new_identity)
     data["identities"] = identities
