@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import getpass
 import importlib
 import json
 import logging
@@ -37,8 +38,8 @@ import os
 import queue
 import threading
 
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import datetime
+from hermes_time import now as _now
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
@@ -398,13 +399,7 @@ def _normalize_retain_tags(value: Any) -> List[str]:
 
 def _utc_timestamp() -> str:
     """Return current timestamp in ISO-8601 with milliseconds."""
-    tz_name = os.environ.get("HERMES_TIMEZONE", "")
-    if tz_name:
-        try:
-            return datetime.now(ZoneInfo(tz_name)).isoformat(timespec="milliseconds")
-        except ZoneInfoNotFoundError:
-            pass
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return _now().isoformat(timespec="milliseconds")
 
 
 def _embedded_profile_name(config: dict[str, Any]) -> str:
@@ -1134,7 +1129,11 @@ class HindsightMemoryProvider(MemoryProvider):
 
         self._config = _load_config()
         self._platform = str(kwargs.get("platform") or "").strip()
-        self._user_id = str(kwargs.get("user_id") or "").strip()
+        if self._platform == "cli":
+            raw_user_id = getpass.getuser()
+        else:
+            raw_user_id = str(kwargs.get("user_id") or "").strip()
+        self._user_id = raw_user_id
         self._user_name = str(kwargs.get("user_name") or "").strip()
         self._chat_id = str(kwargs.get("chat_id") or "").strip()
         self._chat_name = str(kwargs.get("chat_name") or "").strip()
@@ -1409,14 +1408,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        tz_name = os.environ.get("HERMES_TIMEZONE", "")
-        if tz_name:
-            try:
-                now = datetime.now(ZoneInfo(tz_name)).isoformat()
-            except ZoneInfoNotFoundError:
-                now = datetime.now(timezone.utc).isoformat()
-        else:
-            now = datetime.now(timezone.utc).isoformat()
+        now = _now().isoformat()
         return [
             {
                 "role": "user",
@@ -1536,19 +1528,17 @@ class HindsightMemoryProvider(MemoryProvider):
             # Resolve or auto-register identity
             identity_result = _identity_registry.resolve_identity(self._platform, self._user_id)
             if identity_result:
-                _name, priority = identity_result
-                if priority == "admin":
-                    lineage_tags.append("identity:admin")
-                    lineage_tags.append("role:admin")
-                else:
-                    lineage_tags.append("identity:user")
+                _name, role = identity_result
+                lineage_tags.append(f"role:{role}")
             else:
-                _auto_name, auto_priority = _identity_registry.auto_register_identity(
-                    self._platform, self._user_id, self._user_name or ""
+                # CLI session: use OS login name as stable chat_id for identity registration
+                cli_chat_id = self._user_id
+                if self._platform == "cli":
+                    cli_chat_id = getpass.getuser()
+                _auto_name, auto_role = _identity_registry.auto_register_identity(
+                    self._platform, cli_chat_id
                 )
-                lineage_tags.append(f"identity:{auto_priority}")
-                if auto_priority == "admin":
-                    lineage_tags.append("role:admin")
+                lineage_tags.append(f"role:{auto_role}")
         # END CUSTOM: Tag isolation
 
         # Snapshot the state needed for the retain. The writer may run after
@@ -1887,7 +1877,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if scope == "all_platforms":
             identity_result = _identity_registry.resolve_identity(self._platform, self._user_id)
             if identity_result:
-                name, priority = identity_result
+                name, role = identity_result
                 aliases = _identity_registry.get_identity_aliases(name)
                 if aliases:
                     # Build user:xxx tags from all aliases

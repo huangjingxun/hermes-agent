@@ -31,8 +31,10 @@ def _save_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def resolve_identity(platform: str, chat_id: str) -> tuple[str, str] | None:
-    """Resolve platform+chat_id to (identity_name, priority).
+    """Resolve platform+chat_id to (identity_name, role).
     
+    identity_name falls back to the matched alias's chat_id when the
+    JSON entry has no explicit name field (统一 identity = chat_id).
     Returns None if not found and registry empty.
     """
     if not platform or not chat_id:
@@ -42,56 +44,54 @@ def resolve_identity(platform: str, chat_id: str) -> tuple[str, str] | None:
     for identity in data.get("identities", []):
         for alias in identity.get("aliases", []):
             if alias.get("platform") == platform and alias.get("chat_id") == chat_id:
-                return identity.get("name", ""), identity.get("priority", "user")
+                name = identity.get("name") or alias.get("chat_id", "")
+                return name, identity.get("role", "user")
     return None
 
 
-def auto_register_identity(platform: str, chat_id: str, label: str = "") -> tuple[str, str]:
-    """Auto-register unknown user as identity:user with one alias.
+def auto_register_identity(platform: str, chat_id: str) -> tuple[str, str]:
+    """Auto-register unknown user as role:user with one alias.
     
-    Returns (identity_name, priority).
+    Identity name = chat_id, label = chat_id (统一使用 chat_id).
+    Returns (identity_name, role).
     """
     path = get_config_memory_dir() / "identity-registry.json"
     data = _load_json(path)
     identities = data.get("identities", [])
-    
+
     # Check if already exists
     for identity in identities:
         for alias in identity.get("aliases", []):
             if alias.get("platform") == platform and alias.get("chat_id") == chat_id:
-                return identity.get("name", ""), identity.get("priority", "user")
-    
-    # Determine name
-    name = label.strip() or chat_id[:20]
-    
-    # Avoid duplicate names among existing identities
-    existing_names = {i.get("name", "") for i in identities}
-    original_name = name
-    counter = 1
-    while name in existing_names:
-        name = f"{original_name}_{counter}"
-        counter += 1
-    
+                name = identity.get("name") or alias.get("chat_id", "")
+                return name, identity.get("role", "user")
+
+    # Use chat_id as both identity name and label
+    resolved_name = chat_id or "unknown"
+
     new_identity = {
-        "name": name,
-        "priority": "user",
-        "aliases": [{"platform": platform, "chat_id": chat_id, "label": label}]
+        "role": "user",
+        "aliases": [{"platform": platform, "chat_id": chat_id, "label": chat_id}]
     }
     identities.append(new_identity)
     data["identities"] = identities
     _save_json(path, data)
-    return name, "user"
+    return resolved_name, "user"
 
 
 def get_identity_aliases(identity_name: str) -> list[dict[str, str]]:
     """Get all aliases for a given identity name.
+    
+    Falls back to matching against first alias's chat_id when the JSON
+    entry has no explicit name field (统一 identity = chat_id).
     
     Used for cross-platform recall (all_platforms scope).
     """
     path = get_config_memory_dir() / "identity-registry.json"
     data = _load_json(path)
     for identity in data.get("identities", []):
-        if identity.get("name") == identity_name:
+        entry_name = identity.get("name") or (identity.get("aliases", [{}])[0].get("chat_id", ""))
+        if entry_name == identity_name:
             return list(identity.get("aliases", []))
     return []
 
