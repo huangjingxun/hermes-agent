@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import getpass
 import importlib
 import json
 import logging
@@ -38,12 +39,18 @@ import queue
 import threading
 
 from datetime import datetime, timezone
+from hermes_time import now as _now
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+
+# BEGIN CUSTOM: Tag isolation registry
+from . import identity_registry as _identity_registry
+# END CUSTOM: Tag isolation registry
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +276,16 @@ RECALL_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional explicit tags to filter recalled memories.",
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["current_platform", "current_room", "all_platforms", "target_user", "system", "global"],
+                "description": "Recall scope. Default: current_platform.",
+            },
         },
         "required": ["query"],
     },
@@ -284,6 +301,11 @@ REFLECT_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "The question to reflect on."},
+            "scope": {
+                "type": "string",
+                "enum": ["current_platform", "current_room", "all_platforms", "target_user", "system", "global"],
+                "description": "Reflect scope. Default: current_platform.",
+            },
         },
         "required": ["query"],
     },
@@ -377,8 +399,8 @@ def _normalize_retain_tags(value: Any) -> List[str]:
 
 
 def _utc_timestamp() -> str:
-    """Return current UTC timestamp in ISO-8601 with milliseconds and Z suffix."""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    """Return current timestamp in ISO-8601 with milliseconds."""
+    return _now().isoformat(timespec="milliseconds")
 
 
 def _embedded_profile_name(config: dict[str, Any]) -> str:
@@ -637,8 +659,7 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception:
                 pass
         existing.update(values)
-        from utils import atomic_json_write
-        atomic_json_write(config_path, existing, mode=0o600)
+        config_path.write_text(json.dumps(existing, indent=2))
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Custom setup wizard — installs only the deps needed for the selected mode."""
@@ -1115,7 +1136,11 @@ class HindsightMemoryProvider(MemoryProvider):
 
         self._config = _load_config()
         self._platform = str(kwargs.get("platform") or "").strip()
-        self._user_id = str(kwargs.get("user_id") or "").strip()
+        if self._platform == "cli":
+            raw_user_id = getpass.getuser()
+        else:
+            raw_user_id = str(kwargs.get("user_id") or "").strip()
+        self._user_id = raw_user_id
         self._user_name = str(kwargs.get("user_name") or "").strip()
         self._chat_id = str(kwargs.get("chat_id") or "").strip()
         self._chat_name = str(kwargs.get("chat_name") or "").strip()
@@ -1186,6 +1211,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._tags = self._retain_tags or None
         self._recall_tags = self._config.get("recall_tags") or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
+        # BEGIN CUSTOM: Tag isolation config
+        self._enable_tag_isolation = bool(self._config.get("enable_tag_isolation", False))
+        # END CUSTOM: Tag isolation config
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
         ).strip()
@@ -1341,16 +1369,35 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 if self._prefetch_method == "reflect":
                     logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                    # BEGIN CUSTOM: Tag isolation - prefetch scope filtering
+                    reflect_kwargs = {
+                        "bank_id": self._bank_id, "query": query, "budget": self._budget,
+                    }
+                    if self._enable_tag_isolation:
+                        scope = "current_room" if self._chat_id and self._chat_id != self._user_id else "current_platform"
+                        scope_tags, scope_match = self._build_recall_tags_for_scope(scope)
+                        if scope_tags:
+                            reflect_kwargs["tags"] = scope_tags
+                            reflect_kwargs["tags_match"] = scope_match or "all"
+                    # END CUSTOM: Tag isolation
+                    resp = self._run_hindsight_operation(lambda client: client.areflect(**reflect_kwargs))
                     text = resp.text or ""
                 else:
                     recall_kwargs: dict = {
                         "bank_id": self._bank_id, "query": query,
                         "budget": self._budget, "max_tokens": self._recall_max_tokens,
                     }
-                    if self._recall_tags:
+                    # BEGIN CUSTOM: Tag isolation - prefetch scope filtering
+                    if self._enable_tag_isolation:
+                        scope = "current_room" if self._chat_id and self._chat_id != self._user_id else "current_platform"
+                        scope_tags, scope_match = self._build_recall_tags_for_scope(scope)
+                        if scope_tags:
+                            recall_kwargs["tags"] = scope_tags
+                            recall_kwargs["tags_match"] = scope_match or "all"
+                    elif self._recall_tags:
                         recall_kwargs["tags"] = self._recall_tags
                         recall_kwargs["tags_match"] = self._recall_tags_match
+                    # END CUSTOM: Tag isolation
                     if self._recall_types:
                         recall_kwargs["types"] = self._recall_types
                     logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
@@ -1369,7 +1416,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now().isoformat()
         return [
             {
                 "role": "user",
@@ -1493,6 +1540,30 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._parent_session_id:
             lineage_tags.append(f"parent:{self._parent_session_id}")
 
+        # BEGIN CUSTOM: Tag isolation - inject identity tags on retain
+        if self._enable_tag_isolation:
+            if self._platform:
+                lineage_tags.append(f"platform:{self._platform}")
+            if self._user_id:
+                lineage_tags.append(f"user:{self._user_id}")
+            if self._chat_id and self._chat_id != self._user_id:
+                lineage_tags.append(f"room:{self._chat_id}")
+            # Resolve or auto-register identity
+            identity_result = _identity_registry.resolve_identity(self._platform, self._user_id)
+            if identity_result:
+                _name, role = identity_result
+                lineage_tags.append(f"role:{role}")
+            else:
+                # CLI session: use OS login name as stable chat_id for identity registration
+                cli_chat_id = self._user_id
+                if self._platform == "cli":
+                    cli_chat_id = getpass.getuser()
+                _auto_name, auto_role = _identity_registry.auto_register_identity(
+                    self._platform, cli_chat_id
+                )
+                lineage_tags.append(f"role:{auto_role}")
+        # END CUSTOM: Tag isolation
+
         # Snapshot the state needed for the retain. The writer may run after
         # _session_turns / _turn_index are mutated by a later sync_turn().
         metadata_snapshot = self._build_metadata(
@@ -1570,9 +1641,22 @@ class HindsightMemoryProvider(MemoryProvider):
                     "bank_id": self._bank_id, "query": query, "budget": self._budget,
                     "max_tokens": self._recall_max_tokens,
                 }
-                if self._recall_tags:
+                # BEGIN CUSTOM: Tag isolation - scope-aware recall
+                if self._enable_tag_isolation:
+                    scope = args.get("scope", "current_platform")
+                    explicit_tags = args.get("tags")
+                    if explicit_tags:
+                        recall_kwargs["tags"] = explicit_tags
+                        recall_kwargs["tags_match"] = "all"
+                    else:
+                        scope_tags, scope_match = self._build_recall_tags_for_scope(scope)
+                        if scope_tags:
+                            recall_kwargs["tags"] = scope_tags
+                            recall_kwargs["tags_match"] = scope_match or "all"
+                elif self._recall_tags:
                     recall_kwargs["tags"] = self._recall_tags
                     recall_kwargs["tags_match"] = self._recall_tags_match
+                # END CUSTOM: Tag isolation
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
@@ -1595,10 +1679,19 @@ class HindsightMemoryProvider(MemoryProvider):
             try:
                 logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
                              self._bank_id, len(query), self._budget)
+                # BEGIN CUSTOM: Tag isolation - scope-aware reflect
+                reflect_kwargs = {
+                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
+                }
+                if self._enable_tag_isolation:
+                    scope = args.get("scope", "current_platform")
+                    scope_tags, scope_match = self._build_recall_tags_for_scope(scope)
+                    if scope_tags:
+                        reflect_kwargs["tags"] = scope_tags
+                        reflect_kwargs["tags_match"] = scope_match or "all"
+                # END CUSTOM: Tag isolation
                 resp = self._run_hindsight_operation(
-                    lambda client: client.areflect(
-                        bank_id=self._bank_id, query=query, budget=self._budget
-                    )
+                    lambda client: client.areflect(**reflect_kwargs)
                 )
                 logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
                 return json.dumps({"result": resp.text or "No relevant memories found."})
@@ -1796,6 +1889,44 @@ class HindsightMemoryProvider(MemoryProvider):
         # / "Unclosed connector" warnings reported in #11923. The loop
         # runs on a daemon thread and is reclaimed on process exit;
         # per-session cleanup happens via self._client.aclose() above.
+
+    # BEGIN CUSTOM: Tag isolation helpers
+    def _build_recall_tags_for_scope(self, scope: str) -> tuple[list[str], str]:
+        """Build recall tags and match mode from scope string.
+        
+        Returns (tags, match_mode). Empty tags means no filtering (global).
+        """
+        scope = (scope or "current_platform").strip().lower()
+        if scope == "global":
+            return [], ""
+        if scope == "system":
+            return ["platform:system", "user:cortana"], "all"
+        if scope == "all_platforms":
+            identity_result = _identity_registry.resolve_identity(self._platform, self._user_id)
+            if identity_result:
+                name, role = identity_result
+                aliases = _identity_registry.get_identity_aliases(name)
+                if aliases:
+                    # Build user:xxx tags from all aliases
+                    user_tags = [f"user:{a['user_id']}" for a in aliases]
+                    return user_tags, "any"
+            return [f"user:{self._user_id}"], "all"
+        if scope == "target_user":
+            # Query a specific user - user_id must be provided in context
+            return [f"user:{self._user_id}"], "all"
+        if scope == "current_room":
+            if self._chat_id and self._chat_id != self._user_id:
+                return [
+                    f"platform:{self._platform}",
+                    f"room:{self._chat_id}",
+                ], "all"
+            return [f"platform:{self._platform}", f"user:{self._user_id}"], "all"
+        # Default: current_platform
+        return [
+            f"platform:{self._platform}",
+            f"user:{self._user_id}",
+        ], "all"
+    # END CUSTOM: Tag isolation helpers
 
 
 def register(ctx) -> None:

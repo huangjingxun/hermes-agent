@@ -121,20 +121,7 @@ def _import_openai_client():
     return OpenAIClient
 
 def _import_mistral_client():
-    """Lazy import Mistral client. Returns the class or raises ImportError.
-
-    Calls :func:`tools.lazy_deps.ensure` first so the ``mistralai`` SDK gets
-    installed on demand if the user picked Mistral as their STT/TTS provider
-    but never ran the post-setup hook (e.g. enabled it by editing config.yaml
-    directly). Mirrors the ElevenLabs lazy-import path.
-    """
-    try:
-        from tools.lazy_deps import ensure
-        ensure("tts.mistral", prompt=False)
-    except ImportError:
-        pass
-    except Exception as e:  # FeatureUnavailable or any unexpected error
-        raise ImportError(str(e))
+    """Lazy import Mistral client. Returns the class or raises ImportError."""
     from mistralai.client import Mistral
     return Mistral
 
@@ -944,6 +931,12 @@ async def _generate_edge_tts(text: str, output_path: str, tts_config: Dict[str, 
         pct = round((speed - 1.0) * 100)
         kwargs["rate"] = f"{pct:+d}%"
 
+    # BEGIN CUSTOM: expose Edge TTS pitch config
+    pitch = edge_config.get("pitch")
+    if pitch:
+        kwargs["pitch"] = str(pitch)
+    # END CUSTOM
+
     communicate = _edge_tts.Communicate(text, **kwargs)
     await communicate.save(output_path)
     return output_path
@@ -1269,7 +1262,6 @@ def _generate_minimax_tts(text: str, output_path: str, tts_config: Dict[str, Any
 
     if is_t2a_v2:
         # t2a_v2 returns JSON with hex-encoded audio
-        response.raise_for_status()
         result = response.json()
         base_resp = result.get("base_resp", {})
         status_code = base_resp.get("status_code", -1)
@@ -2039,6 +2031,36 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    # BEGIN CUSTOM: strip emoji before TTS synthesis
+    # Only modern emoji pictographs and dingbats that TTS engines mispronounce
+    # are removed. Kaomoji (≧▽≦), box-drawing (┌─┐│), punctuation, and all
+    # plain text characters are PRESERVED.
+    _cleaned = re.sub(
+        r"[\U0001F1E0-\U0001F1FF"
+        r"\U0001F300-\U0001F5FF"
+        r"\U0001F600-\U0001F64F"
+        r"\U0001F680-\U0001F6FF"
+        r"\U0001F7E0-\U0001F7FF"
+        r"\U0001F900-\U0001F9FF"
+        r"\U0001FA00-\U0001FA6F"
+        r"\U0001FA70-\U0001FAFF"
+        r"\uFE0F"  # emoji style variation selector
+        r"\u2705\u2714\u274C\u2716\u2718"
+        r"\u27A1\u2B05\u2B06\u2B07\u2B55\u26A0]",
+        "",
+        text,
+    )
+    _cleaned = re.sub(r"\s+", " ", _cleaned).strip()
+    if _cleaned != text:
+        logger.debug(
+            "TTS text sanitized: removed %d decorative chars"
+            "; original text length %d",
+            len(text) - len(_cleaned),
+            len(text),
+        )
+    text = _cleaned
+    # END CUSTOM
+
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
 
@@ -2168,16 +2190,21 @@ def text_to_speech_tool(
             _generate_xai_tts(text, file_str, tts_config)
 
         elif provider == "mistral":
-            try:
-                _import_mistral_client()
-            except ImportError:
-                return json.dumps({
-                    "success": False,
-                    "error": "Mistral provider selected but 'mistralai' package not installed. "
-                             "Run: pip install 'hermes-agent[mistral]'"
-                }, ensure_ascii=False)
-            logger.info("Generating speech with Mistral Voxtral TTS...")
-            _generate_mistral_tts(text, file_str, tts_config)
+            # `mistralai` PyPI package was quarantined on 2026-05-12 after a
+            # malicious 2.4.6 release. Surface a clear status message instead
+            # of attempting an import that would either fail or pull a stale
+            # cached package.
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Mistral Voxtral TTS is temporarily disabled. The "
+                    "`mistralai` PyPI package was quarantined on 2026-05-12 "
+                    "after a malicious 2.4.6 release. Switch tts.provider in "
+                    "config.yaml to 'edge', 'elevenlabs', 'openai', 'minimax', "
+                    "'gemini', 'xai', 'neutts', or 'kittentts'. Mistral "
+                    "support will return once PyPI un-quarantines the package."
+                ),
+            }, ensure_ascii=False)
 
         elif provider == "gemini":
             logger.info("Generating speech with Google Gemini TTS...")

@@ -32,12 +32,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import itertools
 import json
 import logging
 import mimetypes
 import os
 import re
 import time
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,6 +81,7 @@ APP_CMD_LEGACY_CALLBACK = "aibot_callback"
 APP_CMD_EVENT_CALLBACK = "aibot_event_callback"
 APP_CMD_SEND = "aibot_send_msg"
 APP_CMD_RESPONSE = "aibot_respond_msg"
+APP_CMD_RESPONSE_UPDATE = "aibot_respond_update_msg"
 APP_CMD_PING = "ping"
 APP_CMD_UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
 APP_CMD_UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
@@ -94,6 +97,22 @@ HEARTBEAT_INTERVAL_SECONDS = 30.0
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 
 DEDUP_MAX_SIZE = 1000
+
+_audit_logger = logging.getLogger("wecom_send_audit")
+_audit_logger.propagate = False
+_AUDIT_LOG_PATH = Path.home() / ".hermes" / "logs" / "send-audit.log"
+_AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+if not _audit_logger.handlers:
+    from logging.handlers import TimedRotatingFileHandler
+    _audit_handler = TimedRotatingFileHandler(
+        _AUDIT_LOG_PATH, when="midnight", interval=1, backupCount=7, encoding="utf-8",
+    )
+    _audit_handler.setFormatter(logging.Formatter(
+        "%(asctime)s|%(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    _audit_logger.setLevel(logging.INFO)
+    _audit_logger.addHandler(_audit_handler)
 
 IMAGE_MAX_BYTES = 10 * 1024 * 1024
 VIDEO_MAX_BYTES = 10 * 1024 * 1024
@@ -161,15 +180,7 @@ class WeComAdapter(BasePlatformAdapter):
         ).strip() or DEFAULT_WS_URL
 
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "open")).strip().lower()
-        # dm_policy already honors WECOM_DM_POLICY, so the allowlist must honor
-        # WECOM_ALLOWED_USERS too. Without the env fallback an env-only setup
-        # (dm_policy=allowlist via env, no config extra) runs with an empty
-        # allowlist and drops every authorized DM at intake.
-        self._allow_from = _coerce_list(
-            extra.get("allow_from")
-            or extra.get("allowFrom")
-            or os.getenv("WECOM_ALLOWED_USERS", "")
-        )
+        self._allow_from = _coerce_list(extra.get("allow_from") or extra.get("allowFrom"))
 
         self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "open")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
@@ -183,6 +194,16 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._dedup = MessageDeduplicator(max_size=DEDUP_MAX_SIZE)
         self._reply_req_ids: Dict[str, str] = {}
+        # ═══════════════════════════════════════════════════════════════════
+        self._approval_state: Dict[int, Tuple[str, str, str, str, str]] = {}
+        self._approval_counter = itertools.count(1)
+        self._approval_startup_seed = int(time.time())
+        self._approval_admin_ids = _coerce_list(
+            extra.get("allow_admin_from") or extra.get("allowAdminFrom")
+        )
+        self._approval_group_admin_ids = _coerce_list(
+            extra.get("group_allow_admin_from") or extra.get("groupAllowAdminFrom")
+        )
 
         # Text batching: merge rapid successive messages (Telegram-style).
         # WeCom clients split long messages around 4000 chars.
@@ -192,6 +213,24 @@ class WeComAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
         self._device_id = uuid.uuid4().hex
         self._last_chat_req_ids: Dict[str, str] = {}
+
+    @staticmethod
+    def _audit_log(
+        method: str,
+        chat_id: str,
+        chat_type: int,
+        content_type: str,
+        detail: str,
+        result: str,
+    ) -> None:
+        """Append a single audit record. Failure is swallowed — never blocks send."""
+        try:
+            _audit_logger.info(
+                "%s|%s|%d|%s|%s|%s",
+                method, chat_id, chat_type, content_type, detail, result,
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -406,7 +445,10 @@ class WeComAdapter(BasePlatformAdapter):
         if cmd in CALLBACK_COMMANDS:
             await self._on_message(payload)
             return
-        if cmd in {APP_CMD_PING, APP_CMD_EVENT_CALLBACK}:
+        if cmd == APP_CMD_EVENT_CALLBACK:
+            asyncio.ensure_future(self._on_event_callback(payload))
+            return
+        if cmd == APP_CMD_PING:
             return
 
         logger.debug("[%s] Ignoring websocket payload: %s", self.name, cmd or payload)
@@ -639,7 +681,7 @@ class WeComAdapter(BasePlatformAdapter):
             event = self._pending_text_batches.pop(key, None)
             if not event:
                 return
-            logger.info(
+            logger.debug(
                 "[WeCom] Flushing text batch %s (%d chars)",
                 key, len(event.text or ""),
             )
@@ -854,11 +896,6 @@ class WeComAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Policy helpers
     # ------------------------------------------------------------------
-
-    @property
-    def enforces_own_access_policy(self) -> bool:
-        """WeCom gates DM/group access at intake via dm_policy/group_policy."""
-        return True
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
@@ -1369,6 +1406,7 @@ class WeComAdapter(BasePlatformAdapter):
         del metadata
 
         if not chat_id:
+            self._audit_log("send", chat_id, 0, "text", "0", "error:chat_id_empty")
             return SendResult(success=False, error="chat_id is required")
 
         try:
@@ -1389,15 +1427,19 @@ class WeComAdapter(BasePlatformAdapter):
                     },
                 )
         except asyncio.TimeoutError:
+            self._audit_log("send", chat_id, 0, "text", str(len(content)), "error:timeout")
             return SendResult(success=False, error="Timeout sending message to WeCom")
         except Exception as exc:
+            self._audit_log("send", chat_id, 0, "text", str(len(content)), f"error:{exc}")
             logger.error("[%s] Send failed: %s", self.name, exc)
             return SendResult(success=False, error=str(exc))
 
         error = self._response_error(response)
         if error:
+            self._audit_log("send", chat_id, 0, "text", str(len(content)), f"error:{error}")
             return SendResult(success=False, error=error)
 
+        self._audit_log("send", chat_id, 0, "text", str(len(content)), "success")
         return SendResult(
             success=True,
             message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
@@ -1469,10 +1511,53 @@ class WeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
+        """Send a voice message to WeCom.
+
+        Converts the input audio to AMR-NB (8 kHz / 12.20 kbps) so it displays
+        as a native voice bubble on mobile clients.
+        """
         del kwargs
+        path = Path(audio_path)
+        if not path.exists():
+            return SendResult(success=False, error=f"Audio file not found: {audio_path}")
+
+        amr_path = path.with_suffix(".amr")
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-i", str(path),
+                    "-ar", "8000", "-ac", "1",
+                    "-af", (
+                        "deesser=i=1.0:m=1,"
+                        "lowpass=f=3200,"
+                        "acompressor=threshold=-3dB:ratio=2:attack=5:release=50"
+                    ),
+                    "-acodec", "amr_nb", "-b:a", "12.20k",
+                    str(amr_path),
+                ],
+                capture_output=True,
+                timeout=60,
+            )
+            if result.returncode != 0 or not amr_path.exists():
+                logger.warning(
+                    "[%s] AMR-NB conversion failed, sending raw: %s",
+                    self.name,
+                    result.stderr.decode() if result.stderr else "unknown error",
+                )
+                amr_path = path  # fallback to original
+            else:
+                logger.debug(
+                    "[%s] Converted %s to AMR-NB (8kHz/12.20kbps)",
+                    self.name,
+                    path.name,
+                )
+        except Exception as exc:
+            logger.warning("[%s] AMR conversion error: %s", self.name, exc)
+            amr_path = path  # fallback to original
+
         return await self._send_media_source(
             chat_id=chat_id,
-            media_source=audio_path,
+            media_source=str(amr_path),
             caption=caption,
             reply_to=reply_to,
         )
@@ -1486,12 +1571,19 @@ class WeComAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         del kwargs
-        return await self._send_media_source(
+        chat_type = 1 if chat_id.startswith("wo") else (2 if chat_id.startswith("wr") else 0)
+        self._audit_log("send_video", chat_id, chat_type, "video", video_path, "attempt")
+        result = await self._send_media_source(
             chat_id=chat_id,
             media_source=video_path,
             caption=caption,
             reply_to=reply_to,
         )
+        self._audit_log(
+            "send_video", chat_id, chat_type, "video", video_path,
+            "success" if result.success else f"error:{result.error}",
+        )
+        return result
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """WeCom does not expose typing indicators in this adapter."""
@@ -1503,6 +1595,365 @@ class WeComAdapter(BasePlatformAdapter):
             "name": chat_id,
             "type": "group" if chat_id and chat_id.lower().startswith("group") else "dm",
         }
+
+    _APPROVAL_CHOICE_LABELS = {
+        "once": "执行一次",
+        "session": "本次会话",
+        "always": "永久允许",
+        "deny": "拒绝",
+    }
+
+    _APPROVAL_UNAUTHORIZED_TEXT = "⛔ 无权限，操作被拒绝"
+
+    _APPROVAL_CHOICE_MAP = {
+        "ea:once": "once",
+        "ea:session": "session",
+        "ea:always": "always",
+        "ea:deny": "deny",
+    }
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a WeCom ``button_interaction`` template card for command approval.
+
+        The card displays the full command and reason, and provides four
+        buttons (once / session / always / deny).  Button clicks are
+        handled via ``aibot_event_callback`` in ``_on_event_callback``.
+        """
+        del metadata
+        if not self._ws or self._ws.closed:
+            return SendResult(success=False, error="Not connected")
+        try:
+            approval_id = next(self._approval_counter)
+            task_id = f"{self._approval_startup_seed}{approval_id}"
+            body = {
+                "chatid": chat_id,
+                "msgtype": "template_card",
+                "template_card": {
+                    "card_type": "button_interaction",
+                    "main_title": {
+                        "title": "⚠️ 命令审批",
+                    },
+                    "sub_title_text": command,
+                    "quote_area": {
+                        "title": "原因",
+                        "quote_text": description,
+                    },
+                    "task_id": task_id,
+                    "button_list": [
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["once"],
+                            "style": 1,
+                            "key": f"ea:once:{approval_id}",
+                        },
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["session"],
+                            "style": 1,
+                            "key": f"ea:session:{approval_id}",
+                        },
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["always"],
+                            "style": 1,
+                            "key": f"ea:always:{approval_id}",
+                        },
+                        {
+                            "text": self._APPROVAL_CHOICE_LABELS["deny"],
+                            "style": 2,
+                            "key": f"ea:deny:{approval_id}",
+                        },
+                    ],
+                },
+            }
+            logger.debug(
+                "[%s] send_exec_approval card body: chatid=%s desc='%s' task_id=%s quote_text_len=%d",
+                self.name, chat_id, description, task_id, len(command),
+            )
+            response = await self._send_request(APP_CMD_SEND, body)
+            error = self._response_error(response)
+            if error:
+                return SendResult(success=False, error=error)
+            self._approval_state[approval_id] = (session_key, chat_id, task_id, command, description)
+            return SendResult(
+                success=True,
+                message_id=self._payload_req_id(response) or uuid.uuid4().hex[:12],
+                raw_response=response,
+            )
+        except Exception as exc:
+            logger.warning("[%s] send_exec_approval failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _on_event_callback(self, payload: Dict[str, Any]) -> None:
+        """Handle ``aibot_event_callback`` — template-card button clicks."""
+        body = payload.get("body")
+        if not isinstance(body, dict):
+            return
+        logger.debug(
+            "[%s] Event callback raw body: %s",
+            self.name, json.dumps(body, ensure_ascii=False),
+        )
+        event_type = str(body.get("event_type") or "").lower()
+        logger.debug("[%s] Event callback: event_type=%s", self.name, event_type)
+        value = self._extract_button_value(body)
+        if not value:
+            return
+
+        # Extract reply_req_id early so test path can reuse it
+        reply_req_id: Optional[str] = None
+        headers = payload.get("headers")
+        if isinstance(headers, dict):
+            reply_req_id = headers.get("req_id") or headers.get("reqId")
+
+        parts = value.split(":")
+        if len(parts) < 2:
+            logger.debug("[%s] Unrecognised button value: %s", self.name, value)
+            return
+        prefix = f"{parts[0]}:{parts[1]}"
+        choice = self._APPROVAL_CHOICE_MAP.get(prefix)
+        if not choice:
+            # 这里可以扩展额外按钮前缀，当前无额外类型
+            logger.debug("[%s] Unrecognised button choice: %s", self.name, prefix)
+            return
+        approval_id_str = parts[2] if len(parts) > 2 else None
+        approval_id = int(approval_id_str) if approval_id_str and approval_id_str.isdigit() else None
+        if approval_id is None:
+            return
+
+        # ── Extract routing fields ────────────────────────────────────
+        from_info = body.get("from")
+        clicker_id = from_info.get("userid") if isinstance(from_info, dict) else None
+        chatid = body.get("chatid")
+        chattype = body.get("chattype")  # "single" | "group"
+
+        # Extract the original card's task_id (for card identity)
+        event_data = body.get("event", {})
+        if isinstance(event_data, dict):
+            tce = event_data.get("template_card_event", {})
+            if isinstance(tce, dict):
+                task_id = tce.get("task_id")
+            else:
+                task_id = None
+        else:
+            task_id = None
+
+        # Look up state early so both admin and non-admin paths can access command/desc
+        approval_info = self._approval_state.get(approval_id)
+        if approval_info:
+            session_key, target_chat, stored_task_id, original_command, original_desc = approval_info
+        else:
+            session_key, target_chat, stored_task_id, original_command, original_desc = "", "", "", "", ""
+
+        # Fallback task_id (should match, but tolerate mismatch)
+        effective_task_id = task_id or stored_task_id
+
+        # ── Non-admin click ───────────────────────────────────────────
+        if not self._is_callback_user_authorized(clicker_id, chattype):
+            if chattype == "single":
+                # Private chat: send text refusal, leave card untouched
+                if chatid:
+                    asyncio.ensure_future(
+                        self.send(chatid, self._APPROVAL_UNAUTHORIZED_TEXT)
+                    )
+            elif chattype == "group" and reply_req_id and effective_task_id and clicker_id:
+                # Group chat: update only this user's card copy
+                asyncio.ensure_future(
+                    self._send_update_card(
+                        reply_req_id=reply_req_id,
+                        task_id=effective_task_id,
+                        value=self._APPROVAL_UNAUTHORIZED_TEXT,
+                        userids=[clicker_id],
+                        command=original_command,
+                        description=original_desc,
+                    )
+                )
+            logger.debug(
+                "[%s] Ignored approval click from non-admin user %s (approval_id=%s, chattype=%s)",
+                self.name, clicker_id, approval_id_str, chattype,
+            )
+            return
+
+        # ── Admin click: Telegram-style atomic pop ──
+        approval_info = self._approval_state.pop(approval_id, None)
+        if not approval_info:
+            # State already cleaned up (session restart, or another callback popped first)
+            logger.debug("[%s] Approval %d not found or already resolved", self.name, approval_id)
+            return
+        session_key, target_chat, stored_task_id, original_command, original_desc = approval_info
+
+        # ── Resolve (behind the gate) ─────────────────────────────────
+        try:
+            from tools.approval import resolve_gateway_approval
+            count = resolve_gateway_approval(session_key, choice)
+            logger.debug(
+                "[%s] Approval %d resolved: choice=%s, session=%s (%d entries)",
+                self.name, approval_id, choice, session_key, count,
+            )
+        except Exception as exc:
+            logger.error("[%s] Failed to resolve gateway approval: %s", self.name, exc)
+            count = 0
+
+        if count > 0:
+            result_value = self._APPROVAL_CHOICE_LABELS[choice]
+
+            # Update card (full broadcast, no userids) — rebuild original card, only swap buttons
+            if reply_req_id and effective_task_id:
+                asyncio.ensure_future(
+                    self._send_update_card(
+                        reply_req_id=reply_req_id,
+                        task_id=effective_task_id,
+                        value=result_value,
+                        command=original_command,
+                        description=original_desc,
+                    )
+                )
+
+            # Send confirmation message
+            if target_chat:
+                from agent.i18n import t
+                if choice == "deny":
+                    confirm_msg = t("gateway.deny.denied_singular")
+                else:
+                    confirm_msg = t(f"gateway.approve.{choice}_singular")
+                asyncio.ensure_future(self.send(target_chat, confirm_msg))
+
+            # No deferred cleanup needed — state already popped at entry
+
+    @staticmethod
+    def _extract_button_value(body: Dict[str, Any]) -> Optional[str]:
+        """Extract the button key value from an event callback payload.
+
+        Tries several common payload shapes since WeCom may deliver
+        button clicks in different formats depending on the event type.
+        """
+        # Shape 1: {"selected_button": {"key": "..."}} — button_interaction
+        selected = body.get("selected_button")
+        if isinstance(selected, dict):
+            val = selected.get("key") or selected.get("value")
+            if val:
+                return str(val)
+        # Shape 2: {"event_data": {"key": "..."}}
+        event_data = body.get("event_data")
+        if isinstance(event_data, dict):
+            val = event_data.get("key") or event_data.get("value")
+            if val:
+                return str(val)
+        # Shape 3: {"action_info": {"key": "..."}}
+        action_info = body.get("action_info")
+        if isinstance(action_info, dict):
+            val = action_info.get("key") or action_info.get("value")
+            if val:
+                return str(val)
+        # Shape 4: top-level "key" or "value" field
+        val = body.get("key") or body.get("value")
+        if val:
+            return str(val)
+        # Shape 5: {"event": {"template_card_event": {"event_key": "..."}}}
+        # WeCom AI Bot WS button_interaction real payload.
+        event = body.get("event")
+        if isinstance(event, dict):
+            tce = event.get("template_card_event")
+            if isinstance(tce, dict):
+                val = tce.get("event_key")
+                if val:
+                    return str(val)
+        return None
+
+    async def _send_update_card(
+        self,
+        reply_req_id: str,
+        task_id: str,
+        value: str,
+        userids: Optional[List[str]] = None,
+        command: str = "",
+        description: str = "",
+    ) -> None:
+        """Update a template card in-place via the WebSocket update command.
+
+        Rebuilds the original card shape, replacing only the button list
+        with a single sentinel (noop) button that shows the result.
+
+        Must be called within 5 seconds of the original ``aibot_event_callback``
+        and must reuse its ``req_id`` in the ``headers``.
+        """
+        logger.debug(
+            "[Wecom] _send_update_card called: req_id=%s task_id=%s value=%s userids=%s",
+            reply_req_id, task_id, value, userids,
+        )
+        body: Dict[str, Any] = {
+            "response_type": "update_template_card",
+            "template_card": {
+                "card_type": "button_interaction",
+                "main_title": {"title": "⚠️ 命令审批"},
+                "sub_title_text": command,
+                "quote_area": {
+                    "title": "原因",
+                    "quote_text": description,
+                },
+                "task_id": task_id,
+                # button_interaction update 必须保留 ≥1 个按钮（服务端 40016 校验）
+                "button_list": [
+                    {"text": value, "style": 4, "key": "noop:handled"},
+                ],
+            },
+        }
+        if userids is not None:
+            body["userids"] = userids
+
+        try:
+            resp = await self._send_reply_request(
+                reply_req_id,
+                body,
+                cmd=APP_CMD_RESPONSE_UPDATE,
+                timeout=5.0,
+            )
+            errcode = resp.get("errcode")
+            errmsg = resp.get("errmsg")
+            if errcode not in (0, None):
+                logger.error(
+                    "[Wecom] Card update FAILED (req_id=%s, task_id=%s): errcode=%s errmsg=%s",
+                    reply_req_id, task_id, errcode, errmsg,
+                )
+            else:
+                logger.debug(
+                    "[WeCom] Card update OK (req_id=%s, task_id=%s)",
+                    reply_req_id, task_id,
+                )
+        except Exception as exc:
+            logger.error(
+                "[WeCom] Card update FAILED (req_id=%s): %s: %s",
+                reply_req_id, type(exc).__name__, exc, exc_info=True,
+            )
+
+    def _is_callback_user_authorized(
+        self,
+        userid: Optional[str],
+        chattype: Optional[str] = None,
+    ) -> bool:
+        """Return True when *userid* is authorized to approve in the given context.
+
+        Private chats (``chattype == "single"``) use ``_approval_admin_ids``.
+        Group chats (``chattype == "group"``) use ``_approval_group_admin_ids``.
+        An explicitly empty allowlist is treated as **deny-all** (secure
+        default).  Unrecognised *chattype* falls back to the DM list.
+        """
+        if not userid:
+            return False
+
+        if chattype == "group":
+            admins = self._approval_group_admin_ids
+        elif chattype == "single":
+            admins = self._approval_admin_ids
+        else:
+            admins = self._approval_admin_ids
+
+        if not admins:
+            return False
+        return _entry_matches(admins, userid)
 
 
 # ------------------------------------------------------------------
